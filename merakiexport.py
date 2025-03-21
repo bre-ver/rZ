@@ -1,5 +1,3 @@
-
-#RUNZERO_API_KEY = ""
 import requests
 import csv
 import json
