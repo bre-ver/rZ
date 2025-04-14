@@ -5,7 +5,7 @@ import sys
 # ============= CONFIGURATION =============
 SRC_CONSOLE_URL = "https://console.runzero.com"                  # Source runZero console URL
 SRC_API_KEY     = "YOURSAASAPI"                                  # Source Organization API key
-DST_CONSOLE_URL = "https://console.runzero.com"                  # Destination runZero console URL
+DST_CONSOLE_URL = "https://selfhosted.url"                  # Destination runZero console URL
 DST_API_KEY     = "YOURSHAPI"                                    # Destination Organization API key
 SITE_ID         = "SH-SITE-ID"                                   # Destination site ID for upload. Found in URL header of that site.
 SAVE_PATH       = "./"                                           # Local path for temporary file storage
