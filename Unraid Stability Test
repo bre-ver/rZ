@@ -1,0 +1,263 @@
+#!/bin/bash
+# sysburn.sh — Unraid system stability burn (CPU + RAM + Disk [+ optional NVIDIA GPU])
+# Logs to /boot/logs/sysburn-YYYYmmdd-HHMMSS.log and /boot/logs/sysburn-latest.log.
+
+# Clean-room (stop VMs/containers first)
+#bash /boot/config/scripts/sysburn.sh clean
+
+# Real-world (stack running; lighter RAM pressure)
+#bash /boot/config/scripts/sysburn.sh live
+
+# Real-world + Fast validation (stack running; lighter RAM pressure)
+#bash /boot/config/scripts/sysburn.sh fast
+
+#Knobs you can override on the fly:
+#GPU_BURN_ENABLED=1 GPU_BURN_SECONDS=1800 \
+#STRESS_TIMEOUT=4h STRESS_VM_BYTES=50% RAM_TEST_SIZE=32G \
+#bash /boot/config/scripts/sysburn.sh clean
+
+"
+run in tmux to detach from SSH session and continue running
+
+tmux new -s sysburn
+bash /boot/config/scripts/sysburn.sh fast
+
+detach tmux
+Ctrl + B  then  D
+
+reattach tmux
+tmux attach -t sysburn'
+"
+
+
+
+
+
+set -euo pipefail
+
+# -------------------- User knobs (defaults) --------------------
+CPU_WORKERS_DEFAULT=8
+RAM_TEST_SIZE_DEFAULT="24G"
+RAM_LOOPS_DEFAULT=3
+STRESS_VM_BYTES_DEFAULT="60%"
+STRESS_TIMEOUT_DEFAULT="2h"
+DISK_FILE_DEFAULT="/mnt/cache/sysburn_50G.bin"
+DISK_SIZE_GB_DEFAULT=50
+STRESS_IMAGE="alpine"  # apk add stress-ng inside
+
+# GPU options
+GPU_ENABLE_DEFAULT=1
+GPU_BURN_SECONDS_DEFAULT=1200   # 20m
+GPU_CONTAINER_IMAGE="nvidia/cuda:12.2.0-devel-ubuntu22.04"
+
+# -------------------- Profiles --------------------
+PROFILE="${1:-clean}"  # clean | live | fast
+case "$PROFILE" in
+  clean)
+    CPU_WORKERS=${CPU_WORKERS_DEFAULT}
+    RAM_TEST_SIZE="48G"
+    RAM_LOOPS=${RAM_LOOPS_DEFAULT}
+    STRESS_VM_BYTES="75%"
+    STRESS_TIMEOUT=${STRESS_TIMEOUT_DEFAULT}
+    GPU_BURN_SECONDS=${GPU_BURN_SECONDS_DEFAULT}
+    GPU_ENABLE=${GPU_ENABLE_DEFAULT}
+    DISK_SIZE_GB=50
+    ;;
+  live)
+    CPU_WORKERS=${CPU_WORKERS_DEFAULT}
+    RAM_TEST_SIZE="16G"
+    RAM_LOOPS=${RAM_LOOPS_DEFAULT}
+    STRESS_VM_BYTES="40%"
+    STRESS_TIMEOUT=${STRESS_TIMEOUT_DEFAULT}
+    GPU_BURN_SECONDS=$((GPU_BURN_SECONDS_DEFAULT/2))  # ~10m
+    GPU_ENABLE=${GPU_ENABLE_DEFAULT}
+    DISK_SIZE_GB=50
+    ;;
+  fast)
+    # Quick sanity pass with stack running (assumes ~30GB already in use)
+    CPU_WORKERS=${CPU_WORKERS_DEFAULT}
+    RAM_TEST_SIZE="16G"
+    RAM_LOOPS=1
+    STRESS_VM_BYTES="40%"
+    STRESS_TIMEOUT="30m"
+    GPU_BURN_SECONDS=300         # 5m
+    GPU_ENABLE=${GPU_ENABLE_DEFAULT}
+    DISK_SIZE_GB=50
+    ;;
+  *)
+    echo "Usage: $0 [clean|live|fast]"
+    exit 1
+    ;;
+esac
+
+DISK_FILE=${DISK_FILE_DEFAULT}
+
+# Allow environment overrides (optional)
+CPU_WORKERS=${CPU_WORKERS:-$CPU_WORKERS}
+RAM_TEST_SIZE=${RAM_TEST_SIZE:-$RAM_TEST_SIZE}
+RAM_LOOPS=${RAM_LOOPS:-$RAM_LOOPS}
+STRESS_VM_BYTES=${STRESS_VM_BYTES:-$STRESS_VM_BYTES}
+STRESS_TIMEOUT=${STRESS_TIMEOUT:-$STRESS_TIMEOUT}
+DISK_FILE=${DISK_FILE:-$DISK_FILE}
+DISK_SIZE_GB=${DISK_SIZE_GB:-${DISK_SIZE_GB_DEFAULT}}
+GPU_ENABLE=${GPU_ENABLE:-$GPU_ENABLE}
+GPU_BURN_SECONDS=${GPU_BURN_SECONDS:-$GPU_BURN_SECONDS}
+GPU_CONTAINER_IMAGE=${GPU_CONTAINER_IMAGE:-$GPU_CONTAINER_IMAGE}
+
+# -------------------- Logging --------------------
+mkdir -p /boot/logs
+STAMP="$(date +%Y%m%d-%H%M%S)"
+LOG="/mnt/user/Personal/Backups/sysburn-${STAMP}.log"
+ln -sf "$LOG" /mnt/user/Personal/Backups/sysburn-latest.log
+exec > >(tee -a "$LOG") 2>&1
+log() { echo "[$(date +'%F %T')] $*"; }
+
+# -------------------- Helpers --------------------
+cleanup() {
+  log "Cleanup: removing test file $DISK_FILE (if present)"
+  rm -f -- "$DISK_FILE" || true
+  if [[ -n "${GPU_SAMPLER_PID:-}" ]]; then
+    log "Cleanup: stopping nvidia-smi sampler (pid ${GPU_SAMPLER_PID})"
+    kill "${GPU_SAMPLER_PID}" >/dev/null 2>&1 || true
+    wait "${GPU_SAMPLER_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT
+
+must_have() { command -v "$1" >/dev/null 2>&1 || { log "Missing required tool: $1"; exit 1; }; }
+
+# -------------------- Header --------------------
+echo "=== Unraid System Burn-In (${PROFILE} profile) ==="
+date
+echo "[i] CPU cores: $(nproc)"
+echo "[i] Total memory:"; free -h || true
+if df -h /mnt/cache >/dev/null 2>&1; then
+  echo "[i] Cache free space:"; df -h /mnt/cache
+else
+  log "ERROR: /mnt/cache not found. Edit DISK_FILE path."; exit 1
+fi
+
+# -------------------- Sanity checks --------------------
+must_have docker
+must_have dd
+USE_MEMTESTER=1
+if ! command -v memtester >/dev/null 2>&1; then
+  log "[!] memtester not found (skipping host RAM test)."; USE_MEMTESTER=0
+fi
+
+GPU_AVAILABLE=0
+GPU_SAMPLER_LOG="/tmp/sysburn-nvidia-${STAMP}.csv"
+if [[ "${GPU_ENABLE}" -eq 1 ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  if nvidia-smi >/dev/null 2>&1; then
+    GPU_AVAILABLE=1
+    log "[i] NVIDIA detected. GPU burn enabled. Sampler: ${GPU_SAMPLER_LOG}"
+  else
+    log "[!] nvidia-smi present but not functional; skipping GPU."
+  fi
+else
+  log "[i] GPU test disabled or nvidia-smi not found; skipping GPU."
+fi
+
+FREE_KB=$(df -k --output=avail /mnt/cache | tail -n1 | tr -d ' ')
+NEEDED_KB=$(( DISK_SIZE_GB * 1024 * 1024 ))
+if (( FREE_KB < NEEDED_KB )); then
+  log "ERROR: Not enough free space on /mnt/cache for ${DISK_SIZE_GB}GB test file."; exit 1
+fi
+
+# -------------------- GPU sampler --------------------
+start_gpu_sampler() {
+  nvidia-smi --query-gpu=timestamp,uuid,name,temperature.gpu,power.draw \
+             --format=csv,noheader,nounits -l 1 >> "${GPU_SAMPLER_LOG}" 2>/dev/null &
+  GPU_SAMPLER_PID=$!
+  log "[i] nvidia-smi sampler started (pid ${GPU_SAMPLER_PID})"
+}
+
+# -------------------- [1/4] stress-ng --------------------
+log "[1/4] Launching stress-ng (CPU+RAM+I/O) for ${STRESS_TIMEOUT} …"
+docker run --rm --privileged --pid=host --ipc=host --net=host -v /mnt:/mnt "$STRESS_IMAGE" \
+  sh -c "apk add --no-cache stress-ng >/dev/null && \
+         stress-ng --cpu ${CPU_WORKERS} \
+                   --vm 4 --vm-bytes ${STRESS_VM_BYTES} --vm-keep \
+                   --iomix 4 \
+                   --timeout ${STRESS_TIMEOUT} --verify --metrics-brief"
+log "[1/4] stress-ng completed."
+
+# -------------------- [2/4] memtester --------------------
+if [[ "$USE_MEMTESTER" -eq 1 ]]; then
+  log "[2/4] Running memtester ${RAM_TEST_SIZE} x ${RAM_LOOPS} …"
+  memtester "${RAM_TEST_SIZE}" "${RAM_LOOPS}"
+  log "[2/4] memtester completed."
+else
+  log "[2/4] Skipped memtester (not installed)."
+fi
+
+# -------------------- [3/4] GPU burn (optional) --------------------
+if [[ "$GPU_AVAILABLE" -eq 1 ]]; then
+  log "[3/4] Starting GPU burn for ${GPU_BURN_SECONDS}s across all GPUs …"
+  start_gpu_sampler
+  docker run --rm --gpus all --net=host --ipc=host --pid=host \
+    -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all \
+    "${GPU_CONTAINER_IMAGE}" bash -lc "
+      set -e
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git build-essential
+      git clone --depth=1 https://github.com/wilicc/gpu-burn.git
+      cd gpu-burn
+      make -s
+      ./gpu_burn ${GPU_BURN_SECONDS}
+    "
+  log "[3/4] GPU burn completed."
+else
+  log "[3/4] Skipped GPU burn."
+fi
+
+# -------------------- [4/4] Disk write/read --------------------
+log "[4/4] Disk write: creating ${DISK_SIZE_GB}GB file at ${DISK_FILE} …"
+dd if=/dev/zero of="${DISK_FILE}" bs=1G count="${DISK_SIZE_GB}" oflag=direct status=progress
+sync
+log "[4/4] Disk read: verifying …"
+dd if="${DISK_FILE}" of=/dev/null bs=1G status=progress
+sync
+rm -f "${DISK_FILE}"
+log "[4/4] Disk test completed."
+
+# -------------------- Post-Run Summary --------------------
+summarize_gpu() {
+  if [[ -s "${GPU_SAMPLER_LOG}" ]]; then
+    echo "GPU Summary:"
+    awk -F',' '
+      { gsub(/^ +| +$/,""); temp=$4+0; pwr=$5+0; if(temp>tmax){tmax=temp} if(pwr>pmax){pmax=pwr} }
+      END { printf "  Overall Peaks: Temp=%d C, Power=%.1f W\n", tmax, pmax }
+    ' "${GPU_SAMPLER_LOG}"
+    awk -F',' '
+      { gsub(/^ +| +$/,""); uuid=$2; name=$3; temp=$4+0; pwr=$5+0;
+        if(!(uuid in n)) n[uuid]=name; if(temp>t[uuid]) t[uuid]=temp; if(pwr>w[uuid]) w[uuid]=pwr; }
+      END { for (u in n) printf "  %-38s  Temp=%3d C  Power=%6.1f W\n", n[u] " (" u ")", t[u], w[u]; }
+    ' "${GPU_SAMPLER_LOG}" | sort
+  else
+    echo "GPU Summary: (no sampler data)"
+  fi
+}
+
+extract_pair_speeds() {
+  mapfile -t _lines < <(grep -F 'copied,' "$LOG" | tail -n2)
+  if (( ${#_lines[@]} == 2 )); then
+    local w r
+    w="$(awk -F', ' '{print $3}' <<<"${_lines[0]}")"; w="${w//[[:space:]]/}"
+    r="$(awk -F', ' '{print $3}' <<<"${_lines[1]}")"; r="${r//[[:space:]]/}"
+    printf "  %-12s %s\n" "Disk write:" "${w:-n/a}"
+    printf "  %-12s %s\n" "Disk read:"  "${r:-n/a}"
+  else
+    local speed; speed="$(grep -F 'copied,' "$LOG" | tail -n1 | awk -F', ' '{print $3}' | xargs)"
+    printf "  %-12s %s\n" "Disk speed:" "${speed:-n/a}"
+  fi
+}
+
+log "=== All tests finished ==="
+log "Review ${LOG} (and /boot/logs/sysburn-latest.log). Check Unraid System Log for OOM or I/O errors."
+
+echo
+echo "===== Post-Run Summary ====="
+if [[ "$GPU_AVAILABLE" -eq 1 ]]; then summarize_gpu; else echo "GPU Summary: (skipped)"; fi
+echo "Disk Throughput:"; extract_pair_speeds
+echo "==========================="
