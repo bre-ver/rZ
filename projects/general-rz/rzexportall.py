@@ -14,9 +14,7 @@ Base URL default: https://console.runzero.com
 
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import re
 import sqlite3
 import sys
@@ -26,6 +24,17 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
+
+# =========================
+# USER CONFIG (edit before run)
+# =========================
+RUNZERO_BASE_URL = "https://console.runzero.com"
+RUNZERO_ACCOUNT_TOKEN = ""
+RUNZERO_CLIENT_ID = ""
+RUNZERO_CLIENT_SECRET = ""
+OUTPUT_DIR = "runzero_export"
+MODE = "both"  # raw | merged | both
+ORG_LIMIT = 0  # 0 = no limit
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -331,38 +340,26 @@ def org_name_from_obj(org: Dict[str, Any]) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--base-url",
-        default=os.getenv("RUNZERO_BASE_URL", "https://console.runzero.com"),
-        help="runZero console base URL (default: https://console.runzero.com)",
-    )
-    ap.add_argument("--out", default="runzero_export", help="output directory")
-    ap.add_argument(
-        "--mode",
-        choices=("raw", "merged", "both"),
-        default="both",
-        help="raw = only raw JSONL files, merged = only merged assets JSONL, both = do both",
-    )
-    ap.add_argument(
-        "--org-limit", type=int, default=0, help="debug: limit number of orgs processed (0 = no limit)"
-    )
-    args = ap.parse_args()
-
-    account_token = os.getenv("RUNZERO_ACCOUNT_TOKEN")
-    client_id = os.getenv("RUNZERO_CLIENT_ID")
-    client_secret = os.getenv("RUNZERO_CLIENT_SECRET")
+    account_token = RUNZERO_ACCOUNT_TOKEN.strip()
+    client_id = RUNZERO_CLIENT_ID.strip()
+    client_secret = RUNZERO_CLIENT_SECRET.strip()
     if not account_token and (not client_id or not client_secret):
-        die("set RUNZERO_ACCOUNT_TOKEN or RUNZERO_CLIENT_ID and RUNZERO_CLIENT_SECRET env vars")
+        die("set RUNZERO_ACCOUNT_TOKEN or RUNZERO_CLIENT_ID + RUNZERO_CLIENT_SECRET in USER CONFIG")
 
-    api_base = args.base_url.rstrip("/") + "/api/v1.0"
-    out_root = Path(args.out)
+    mode = MODE.strip().lower()
+    if mode not in ("raw", "merged", "both"):
+        die("MODE must be one of: raw, merged, both")
+    if ORG_LIMIT < 0:
+        die("ORG_LIMIT must be >= 0")
+
+    api_base = RUNZERO_BASE_URL.rstrip("/") + "/api/v1.0"
+    out_root = Path(OUTPUT_DIR)
 
     with requests.Session() as session:
         list_token = account_token or get_token(session, api_base, client_id, client_secret)
         orgs = list_orgs(session, api_base, list_token)
-        if args.org_limit and args.org_limit > 0:
-            orgs = orgs[: args.org_limit]
+        if ORG_LIMIT > 0:
+            orgs = orgs[:ORG_LIMIT]
 
         for idx, org in enumerate(orgs, start=1):
             oid = org_id_from_obj(org)
@@ -375,7 +372,7 @@ def main() -> None:
             print(f"[{idx}/{len(orgs)}] Org: {oname} ({oid}) -> {org_dir}")
 
             db = None
-            if args.mode in ("merged", "both"):
+            if mode in ("merged", "both"):
                 db = init_db(org_dir / "join.sqlite")
 
             org_token = account_token or get_token(session, api_base, client_id, client_secret)
@@ -385,7 +382,7 @@ def main() -> None:
                 new_token = account_token or get_token(session, api_base, client_id, client_secret)
                 return {"Authorization": f"Bearer {new_token}", "Accept": "application/json"}
 
-            save_raw = args.mode in ("raw", "both")
+            save_raw = mode in ("raw", "both")
 
             # Assets
             assets_url = f"{api_base}/export/org/assets.jsonl?_oid={oid}"
