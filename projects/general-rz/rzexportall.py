@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -384,6 +385,9 @@ def main() -> None:
 
             oname = org_name_from_obj(org)
             org_dir = out_root / f"{idx:03d}_{sanitize_filename(oname)}_{oid[:8]}"
+            if org_dir.exists():
+                shutil.rmtree(org_dir)
+            org_dir.mkdir(parents=True, exist_ok=True)
             print(f"[{idx}/{len(orgs)}] Org: {oname} ({oid}) -> {org_dir}")
 
             db = None
