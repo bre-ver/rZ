@@ -37,6 +37,9 @@ OUTPUT_DIR = "runzero_export"
 MODE = "both"  # raw | merged | both
 ORG_LIMIT = 0  # 0 = no limit
 VERIFY_TLS = True  # set to False to skip TLS cert validation
+MAX_ATTEMPTS = 8  # set to 1 for fast connectivity validation
+REQUEST_TIMEOUT = 60  # seconds for non-stream requests
+STREAM_TIMEOUT = 300  # seconds for export stream requests
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -60,9 +63,12 @@ def request_with_retries(
     headers: Optional[Dict[str, str]] = None,
     data: Any = None,
     stream: bool = False,
-    timeout: int = 60,
-    max_attempts: int = 8,
+    timeout: Optional[int] = None,
+    max_attempts: Optional[int] = None,
 ) -> requests.Response:
+    timeout = REQUEST_TIMEOUT if timeout is None else timeout
+    max_attempts = MAX_ATTEMPTS if max_attempts is None else max_attempts
+
     backoff = 1.0
     last_exc: Optional[Exception] = None
 
@@ -185,7 +191,9 @@ def stream_jsonl_to_file_and_db(
 
     auth_retry_used = False
     while True:
-        resp = request_with_retries(session, "GET", url, headers=headers, stream=True, timeout=300)
+        resp = request_with_retries(
+            session, "GET", url, headers=headers, stream=True, timeout=STREAM_TIMEOUT
+        )
 
         if resp.status_code == 401 and refresh_headers and not auth_retry_used:
             resp.close()
