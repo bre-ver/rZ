@@ -36,6 +36,7 @@ RUNZERO_CLIENT_SECRET = ""
 OUTPUT_DIR = "runzero_export"
 MODE = "both"  # raw | merged | both
 ORG_LIMIT = 0  # 0 = no limit
+VERIFY_TLS = True  # set to False to skip TLS cert validation
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -357,6 +358,11 @@ def main() -> None:
     out_root = Path(OUTPUT_DIR)
 
     with requests.Session() as session:
+        session.verify = VERIFY_TLS
+        if not VERIFY_TLS:
+            requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
+            print("WARNING: TLS certificate verification disabled", file=sys.stderr)
+
         list_token = account_token or get_token(session, api_base, client_id, client_secret)
         orgs = list_orgs(session, api_base, list_token)
         if ORG_LIMIT > 0:
