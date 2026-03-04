@@ -13,8 +13,8 @@ Folder Path Setting:
   The default root is resolved relative to your current working directory
   when you run the script.
   The root should contain org folders like:
-    runzero_export/001_Brett_VerMulm_acc5bfcb/
-    runzero_export/002_Child_test_b671e370/
+    runzero_export/001_Test1_acc5bfcb/
+    runzero_export/002_Test2_acc5bfcb/
 
 Usage:
   python convert_runzero_exports.py
@@ -27,8 +27,8 @@ Output:
   For each org folder, files are written to:
     <org_folder>/converted/
   Example:
-    runzero_export/001_Brett_VerMulm_acc5bfcb/converted/assets.csv
-    runzero_export/001_Brett_VerMulm_acc5bfcb/converted/assets.parquet
+    runzero_export/001_Test1_acc5bfcb/converted/assets.csv
+    runzero_export/002_Test2_acc5bfcb/converted/assets.parquet
 """
 
 from __future__ import annotations
