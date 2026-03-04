@@ -6,6 +6,7 @@ Outputs (per org):
   - assets.jsonl
   - software.jsonl
   - vulnerabilities.jsonl
+  - findings.jsonl
   - assets_with_software_vulns.jsonl   (if --mode includes merged)
 
 Auth: OAuth client_credentials to /api/v1.0/account/api/token
@@ -437,6 +438,24 @@ def main() -> None:
                 print(f"  vulns: {v_lines} lines")
             else:
                 print(f"  vulns: {v_lines} lines (not written; merged mode)")
+
+            # Findings (org-level summary findings)
+            if save_raw:
+                findings_url = f"{api_base}/export/org/findings.jsonl?_oid={oid}"
+                findings_path = org_dir / "findings.jsonl"
+                findings_lines, _ = stream_jsonl_to_file_and_db(
+                    session,
+                    findings_url,
+                    headers,
+                    findings_path,
+                    db=None,
+                    table=None,
+                    asset_id_field=None,
+                    refresh_headers=refresh_headers,
+                )
+                print(f"  findings: {findings_lines} lines")
+            else:
+                print("  findings: not exported in merged mode")
 
             if db:
                 merged_path = org_dir / "assets_with_software_vulns.jsonl"
