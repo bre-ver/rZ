@@ -191,7 +191,7 @@ LATERAL_PROTOCOLS = PIVOT_PROTOCOLS | {"rpc", "netbios", "vnc", "telnet"}
 
 # Some common OT/control protocols runZero may surface under service_protocols
 OT_PROTOCOL_HINTS = {"cip", "ethernet/ip", "modbus", "bacnet", "dnp3", "s7", "profinet"}
-INSECURE_PROTOCOLS = {"telnet", "ftp", "tftp", "snmp"}  # you may want snmp1/snmp2 specifically
+INSECURE_PROTOCOLS = {"telnet", "ftp", "tftp", "snmp1", "snmp2"}
 RISKY_TCP_PORTS = {21, 22, 23, 445, 3389, 5900, 5985, 5986, 3306, 5432, 6379, 9200}
 
 REMOTE_ADMIN_SOFTWARE_RE = re.compile(
