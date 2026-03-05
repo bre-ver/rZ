@@ -8,7 +8,7 @@ runZero Risk Score Tagger
 
 High-level flow:
 1) Export assets, software, and vulnerabilities for each target org.
-2) Derive exposure, vulnerability, impact, pivot, and software risk signals.
+2) Derive exposure, vulnerability, impact, pivot/bridge, software, and EDR risk signals.
 3) Compute a numeric score, then map to a 6-level risk band.
 4) Patch asset tags in runZero and emit CSV evidence for review.
 
@@ -111,22 +111,35 @@ def backoff_sleep(attempt: int) -> None:
 # Tail squashing + risk bands
 # -----------------------------
 
-TAIL_START = 90.0     # linear up to 90
-TAIL_RANGE = 10.0     # only 10 points above 90
-TAIL_TAU   = 60.0     # bigger = harder to reach 100
+COMPRESSION_START = 40.0  # compression begins once the score passes this value
+COMPRESSION_TAU = 75.0    # bigger = flatter curve / harder to approach 100
+
+EXTERNAL_CONFIRMED_MAX_SCORE = 100
+EXTERNAL_POTENTIAL_MAX_SCORE = 94
+INTERNAL_ONLY_MAX_SCORE = 88
 
 def squash_to_100(raw: float) -> float:
     """
-    Maps raw (unbounded) -> [0,100], with a diminishing tail above 90.
-    100 remains achievable but requires a very high raw score.
+    Maps raw (unbounded) -> [0,100] with progressive compression after 40.
+    This keeps low-mid scores readable while making high-end inflation harder.
     """
-    if raw <= TAIL_START:
+    if raw <= COMPRESSION_START:
         return raw
-    return TAIL_START + TAIL_RANGE * (1.0 - math.exp(-(raw - TAIL_START) / TAIL_TAU))
+    dynamic_range = 100.0 - COMPRESSION_START
+    return COMPRESSION_START + dynamic_range * (1.0 - math.exp(-(raw - COMPRESSION_START) / COMPRESSION_TAU))
 
 
-def round_to_5(x: float) -> int:
-    # Optional stability; comment out if you want per-point precision.
+def quantize_score(x: float) -> int:
+    """
+    Score quantization with high-end downward pressure.
+    - Normal rounding below 90.
+    - Conservative floor rounding at 90+.
+    - 100 is reserved for truly extreme cases.
+    """
+    if x >= 99.0:
+        return 100
+    if x >= 90.0:
+        return int(5 * math.floor(x / 5.0))
     return int(5 * round(x / 5.0))
 
 
@@ -145,6 +158,14 @@ def risk_band(score: int) -> str:
     return "minimal"
 
 
+def score_cap_from_exposure(flags: "AssetFlags") -> int:
+    if flags.external_confirmed:
+        return EXTERNAL_CONFIRMED_MAX_SCORE
+    if flags.external_potential:
+        return EXTERNAL_POTENTIAL_MAX_SCORE
+    return INTERNAL_ONLY_MAX_SCORE
+
+
 # -----------------------------
 # Scoring model (runZero-native)
 # -----------------------------
@@ -159,10 +180,14 @@ DEFAULT_CREDS_RE = re.compile(
 
 PUBLICLY_EXPOSED_RE = re.compile(r"publicly\s+exposed", re.IGNORECASE)
 POTENTIAL_EXTERNAL_RE = re.compile(r"potential\s+external\s+access", re.IGNORECASE)
+HAS_PUBLIC_RE = re.compile(r"\bhas_public\s*[:=]\s*t\b", re.IGNORECASE)
+MULTIHOME_QUERY_RE = re.compile(r"\bmultihome\s*[:=]\s*t\b", re.IGNORECASE)
+FINDING_EXTERNAL_RE = re.compile(r"\bexternal\b", re.IGNORECASE)
 
 REMOTE_ADMIN_PROTOCOLS = {"ssh", "rdp", "winrm", "wsman", "vnc", "telnet"}
 WEB_PROTOCOLS = {"http", "https", "tls"}
 PIVOT_PROTOCOLS = {"smb", "smb2", "smb3", "rdp", "ssh", "winrm", "wsman", "ldap", "ldaps", "kerberos", "nfs"}
+LATERAL_PROTOCOLS = PIVOT_PROTOCOLS | {"rpc", "netbios", "vnc", "telnet"}
 
 # Some common OT/control protocols runZero may surface under service_protocols
 OT_PROTOCOL_HINTS = {"cip", "ethernet/ip", "modbus", "bacnet", "dnp3", "s7", "profinet"}
@@ -177,6 +202,10 @@ SERVER_STACK_SOFTWARE_RE = re.compile(
     r"(nginx|apache|iis|tomcat|jetty|mysql|mariadb|postgres|mssql|oracle|redis|elasticsearch|docker|kubernetes)",
     re.IGNORECASE,
 )
+EDR_VENDOR_RE = re.compile(
+    r"(microsoft defender|defender for endpoint|crowdstrike|falcon|sentinelone|sentinel one)",
+    re.IGNORECASE,
+)
 
 SAFE_TAG_KEY_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+$")
 SAFE_TAG_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:/+@-]+$")
@@ -189,6 +218,7 @@ BREAKDOWN_CSV_FIELDS = [
     "alive",
     "criticality_rank",
     "eol_os",
+    "outlier_score",
     "addresses",
     "service_protocols",
     "service_count",
@@ -200,6 +230,8 @@ BREAKDOWN_CSV_FIELDS = [
     "vuln_exploitable_count",
     "external_confirmed",
     "external_potential",
+    "reachability_cap",
+    "reachability_cap_applied",
     "default_creds",
     "nuclei_real",
     "top3_evr",
@@ -208,12 +240,21 @@ BREAKDOWN_CSV_FIELDS = [
     "component_impact",
     "component_pivot",
     "component_software",
+    "component_edr",
+    "component_outlier",
     "base_score",
     "total_multiplier",
     "raw_score",
     "final_score",
     "risk_score",
     "risk_band",
+    "bridge_multihome",
+    "bridge_partial_multihome",
+    "bridge_lateral_protocol_count",
+    "edr_expected",
+    "edr_present",
+    "edr_dataset_enabled",
+    "edr_vendor",
     "tag_update_status",
     "rationale",
 ]
@@ -225,6 +266,114 @@ def is_public_ip(ip: str) -> bool:
         return addr.is_global
     except ValueError:
         return False
+
+
+def iter_text_values(obj: object) -> Iterable[str]:
+    if isinstance(obj, str):
+        yield obj
+        return
+    if isinstance(obj, dict):
+        for _, v in obj.items():
+            yield from iter_text_values(v)
+        return
+    if isinstance(obj, list):
+        for item in obj:
+            yield from iter_text_values(item)
+
+
+def object_contains_pattern(obj: object, pat: re.Pattern[str]) -> bool:
+    for text in iter_text_values(obj):
+        if pat.search(text):
+            return True
+    return False
+
+
+def parse_ip(value: object) -> Optional[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    if not isinstance(value, str):
+        return None
+    token = value.strip()
+    if not token:
+        return None
+    token = token.split("%", 1)[0]
+    if not token:
+        return None
+    try:
+        return ipaddress.ip_interface(token).ip
+    except ValueError:
+        try:
+            return ipaddress.ip_address(token)
+        except ValueError:
+            return None
+
+
+def subnet_tokens(values: object) -> set[str]:
+    out: set[str] = set()
+    if not isinstance(values, list):
+        return out
+    for raw in values:
+        ip = parse_ip(raw)
+        if ip is None:
+            continue
+        prefix = 24 if ip.version == 4 else 64
+        net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+        out.add(str(net))
+    return out
+
+
+def edr_vendor_slug(text: str) -> str:
+    t = text.lower()
+    if "crowdstrike" in t or "falcon" in t:
+        return "crowdstrike"
+    if "sentinelone" in t or "sentinel one" in t:
+        return "sentinelone"
+    if "defender" in t:
+        return "microsoft_defender"
+    return ""
+
+
+def detect_edr_vendor(obj: object) -> str:
+    for text in iter_text_values(obj):
+        if not EDR_VENDOR_RE.search(text):
+            continue
+        vendor = edr_vendor_slug(text)
+        if vendor:
+            return vendor
+    return ""
+
+
+def merge_pipe_values(existing: str, value: str) -> str:
+    if not value:
+        return existing
+    if not existing:
+        return value
+    parts = {p for p in existing.split("|") if p}
+    parts.add(value)
+    return "|".join(sorted(parts))
+
+
+def os_family(asset: dict) -> str:
+    os_blob = " ".join(
+        str(asset.get(k) or "")
+        for k in ("os", "os_product", "os_vendor", "os_version")
+    ).lower()
+    if "windows" in os_blob:
+        return "windows"
+    if any(k in os_blob for k in ("mac os", "macos", "os x", "darwin")):
+        return "macos"
+    if any(k in os_blob for k in ("linux", "ubuntu", "debian", "centos", "red hat", "rhel", "fedora", "suse", "alpine")):
+        return "linux"
+    return ""
+
+
+def edr_expected(asset: dict) -> bool:
+    fam = os_family(asset)
+    if not fam:
+        return False
+    asset_type = str(asset.get("type") or "").lower()
+    if any(k in asset_type for k in ("desktop", "laptop", "server", "workstation", "endpoint")):
+        return True
+    os_blob = " ".join(str(asset.get(k) or "") for k in ("os", "os_product")).lower()
+    return "server" in os_blob
 
 
 def normalize_tags(tags_raw: object) -> Dict[str, str]:
@@ -395,7 +544,15 @@ def exploit_evidence(v: dict) -> float:
     if is_nuclei and PANEL_DETECT_RE.search(name):
         return 0.0  # explicitly ignored
     if is_nuclei:
-        return 0.95
+        # Only give nuclei "validated" boost when the finding is high/critical.
+        rank = vulnerability_rank(v)
+        sev = severity_weight(v)
+        if rank >= 3 or sev >= 7.0:
+            return 0.95
+        # Lower-severity nuclei findings are treated as normal low/medium evidence.
+        if rank == 2 or sev >= 4.0:
+            return 0.35
+        return 0.25
     if vulnerability_exploitable(v):
         return 0.80
 
@@ -425,6 +582,14 @@ def is_real_nuclei(v: dict) -> bool:
     if PANEL_DETECT_RE.search(name):
         return False
     return True
+
+
+def is_elevated_nuclei(v: dict) -> bool:
+    if not is_real_nuclei(v):
+        return False
+    rank = vulnerability_rank(v)
+    sev = severity_weight(v)
+    return rank >= 3 or sev >= 7.0
 
 
 def reachability_factor(asset_flags: "AssetFlags") -> float:
@@ -468,19 +633,20 @@ class VulnStats:
     exploitable_count: int = 0
     default_creds_count: int = 0
     nuclei_count: int = 0
+    nuclei_elevated_count: int = 0
 
 
 def vuln_pressure_score(stats: VulnStats) -> float:
     pressure = 0.0
-    pressure += min(6.0, float(stats.critical_count) * 1.8)
-    pressure += min(4.0, float(stats.high_count) * 0.8)
+    pressure += min(5.0, float(stats.critical_count) * 1.5)
+    pressure += min(3.0, float(stats.high_count) * 0.6)
     if stats.exploitable_count >= 2:
-        pressure += 1.0
+        pressure += 0.8
     elif stats.exploitable_count == 1:
-        pressure += 0.5
+        pressure += 0.4
     if stats.default_creds_count > 0:
-        pressure += 1.5
-    return min(10.0, pressure)
+        pressure += 1.0
+    return min(8.0, pressure)
 
 
 def vuln_score_from_top3(top3: List[float], stats: VulnStats) -> float:
@@ -491,57 +657,57 @@ def vuln_score_from_top3(top3: List[float], stats: VulnStats) -> float:
     for n in norms:
         prod *= (1.0 - n)
     agg = 1.0 - prod
-    return min(40.0, (35.0 * agg) + vuln_pressure_score(stats))
+    return min(36.0, (30.0 * agg) + vuln_pressure_score(stats))
 
 
 def exposure_score(asset: dict, flags: "AssetFlags") -> float:
     score = 0.0
     if flags.external_confirmed:
-        score += 15.0
+        score += 16.0
     elif flags.external_potential:
         score += 8.0
 
     protos = set((asset.get("service_protocols") or []))
     protos_norm = {p.lower() for p in protos if isinstance(p, str)}
 
-    ra = sum(3 for p in protos_norm if p in REMOTE_ADMIN_PROTOCOLS)
-    score += float(min(6, ra))
+    ra = sum(2 for p in protos_norm if p in REMOTE_ADMIN_PROTOCOLS)
+    score += float(min(4, ra))
 
-    web = 2 if (protos_norm & WEB_PROTOCOLS) else 0
-    score += float(min(4, web))
+    web = 1 if (protos_norm & WEB_PROTOCOLS) else 0
+    score += float(min(2, web))
 
     bucket = 0
     if {"smb", "smb2", "smb3"} & protos_norm:
         bucket += 2
     if {"ldap", "ldaps"} & protos_norm:
         bucket += 2
-    score += float(min(4, bucket))
+    score += float(min(3, bucket))
 
     ot = 0
     for p in protos_norm:
         if p in OT_PROTOCOL_HINTS:
             ot += 2
-    score += float(min(4, ot))
+    score += float(min(3, ot))
 
     insecure = sum(1 for p in protos_norm if p in INSECURE_PROTOCOLS)
-    score += float(min(3, insecure))
+    score += float(min(2, insecure))
 
     tcp_count = as_int(asset.get("service_count_tcp")) or 0
     if tcp_count >= 20:
-        score += 3.0
-    elif tcp_count >= 10:
         score += 2.0
+    elif tcp_count >= 10:
+        score += 1.5
     elif tcp_count >= 5:
-        score += 1.0
+        score += 0.75
 
     tcp_ports = set()
     for p in (asset.get("service_ports_tcp") or []):
         port = as_int(p)
         if port is not None and port > 0:
             tcp_ports.add(port)
-    score += float(min(3, len(tcp_ports & RISKY_TCP_PORTS)))
+    score += float(min(2, len(tcp_ports & RISKY_TCP_PORTS)))
 
-    return min(25.0, score)
+    return min(22.0, score)
 
 
 def impact_score(asset: dict) -> float:
@@ -556,71 +722,108 @@ def impact_score(asset: dict) -> float:
     criticality_rank = as_int(asset.get("criticality_rank")) or 0
     criticality_score = 0.0
     if criticality_rank >= 4:
-        criticality_score = 15.0
-    elif criticality_rank == 3:
         criticality_score = 13.0
+    elif criticality_rank == 3:
+        criticality_score = 11.0
     elif criticality_rank == 2:
-        criticality_score = 10.0
+        criticality_score = 8.0
     elif criticality_rank == 1:
-        criticality_score = 7.0
+        criticality_score = 5.0
 
     if "firewall" in a_type or "vpn" in a_type or "router" in a_type:
-        return max(15.0, criticality_score)
+        return max(14.0, criticality_score)
     if "network appliance" in a_type and ("fire" in names or "vpn" in names or "gateway" in names):
-        return max(15.0, criticality_score)
+        return max(14.0, criticality_score)
     if "edge" in tag_keys or "dmz" in tag_keys:
-        return max(15.0, criticality_score)
+        return max(14.0, criticality_score)
 
     if "proxmox" in service_products or "proxmox" in names or "pve" in names:
-        return max(15.0, criticality_score)
+        return max(14.0, criticality_score)
     if "esxi" in names or "vmware" in service_products:
-        return max(15.0, criticality_score)
+        return max(14.0, criticality_score)
 
     tag_blob = " ".join(tag_keys | tag_vals)
     if any(k in tag_blob for k in ("ot", "ics", "scada", "plc", "hmi")):
-        return max(12.0, criticality_score)
+        return max(11.0, criticality_score)
 
     if "server" in a_type:
-        return max(10.0, criticality_score)
+        return max(9.0, criticality_score)
     if "switch" in a_type or "wap" in a_type:
-        return max(8.0, criticality_score)
+        return max(6.5, criticality_score)
     if "desktop" in a_type or "laptop" in a_type:
-        return max(6.0, criticality_score)
-    if "phone" in a_type or "mobile" in a_type:
         return max(5.0, criticality_score)
+    if "phone" in a_type or "mobile" in a_type:
+        return max(4.0, criticality_score)
     if "tv" in a_type or "iot" in a_type:
         return max(2.0, criticality_score)
     if "windows server" in os_product or "debian" in os_product or "ubuntu" in os_product:
-        return max(10.0, criticality_score)
-    return max(6.0, criticality_score)
+        return max(8.5, criticality_score)
+    return max(4.0, criticality_score)
 
 
-def pivot_score(asset: dict) -> float:
+@dataclass
+class BridgeSignals:
+    multihome: bool = False
+    partial_multihome: bool = False
+    lateral_protocol_count: int = 0
+
+
+def derive_bridge_signals(asset: dict, multihome_query_hit: bool = False) -> BridgeSignals:
+    protos = {p.lower() for p in (asset.get("service_protocols") or []) if isinstance(p, str)}
+    lateral_count = len(protos & LATERAL_PROTOCOLS)
+
+    addr_subnets = subnet_tokens(asset.get("addresses"))
+    addr_extra_subnets = subnet_tokens(asset.get("addresses_extra"))
+    subnet_meta = asset.get("subnets") or {}
+    subnet_meta_count = len(subnet_meta.keys()) if isinstance(subnet_meta, dict) else 0
+
+    multihome = bool(multihome_query_hit or len(addr_subnets) >= 2 or subnet_meta_count >= 2)
+    partial = False
+    if not multihome and addr_extra_subnets:
+        if len(addr_subnets | addr_extra_subnets) >= 2:
+            partial = True
+        elif not addr_subnets:
+            partial = True
+
+    return BridgeSignals(
+        multihome=multihome,
+        partial_multihome=partial,
+        lateral_protocol_count=lateral_count,
+    )
+
+
+def pivot_score(asset: dict, bridge: BridgeSignals) -> float:
     score = 0.0
     protos = {p.lower() for p in (asset.get("service_protocols") or []) if isinstance(p, str)}
-    for p in protos:
-        if p in PIVOT_PROTOCOLS:
-            score += 3.0
-    score = min(score, 12.0)
+    score += min(6.0, 1.5 * float(bridge.lateral_protocol_count))
 
+    if bridge.multihome:
+        score += 4.0
+    elif bridge.partial_multihome:
+        score += 1.5
+
+    # Keep this as a small fallback signal when subnet metadata disagrees with address-based parsing.
     subnets = asset.get("subnets") or {}
-    if isinstance(subnets, dict) and len(subnets.keys()) >= 2:
-        score += 5.0
-    addresses = asset.get("addresses") or []
-    if isinstance(addresses, list) and len(addresses) >= 2:
-        score += 2.0
+    if not bridge.multihome and isinstance(subnets, dict) and len(subnets.keys()) >= 2:
+        score += 0.5
+
+    if not bridge.multihome and not bridge.partial_multihome:
+        addresses = asset.get("addresses") or []
+        if isinstance(addresses, list) and len(addresses) >= 2:
+            score += 0.5
+
     if protos & OT_PROTOCOL_HINTS:
-        score += 2.0
-    return min(15.0, score)
+        score += 1.5
+    return min(11.0, score)
 
 
 def production_multiplier(asset: dict) -> float:
     tags = normalize_tags(asset.get("tags"))
     for k, v in tags.items():
         if str(k).lower() == "production":
-            return 1.15
+            return 1.10
         if str(k).lower() in {"group", "env", "environment"} and str(v).lower() == "production":
-            return 1.15
+            return 1.10
 
     subnets = asset.get("subnets") or {}
     if isinstance(subnets, dict):
@@ -629,10 +832,10 @@ def production_multiplier(asset: dict) -> float:
                 continue
             stags = meta.get("tags") or {}
             if any(str(t).lower() == "production" for t in stags.keys()):
-                return 1.15
+                return 1.10
             for tk, tv in stags.items():
                 if str(tk).lower() in {"group", "env", "environment"} and str(tv).lower() == "production":
-                    return 1.15
+                    return 1.10
     return 1.0
 
 
@@ -646,83 +849,147 @@ class SoftwareSignals:
 def software_score(signals: SoftwareSignals) -> float:
     score = 0.0
     if signals.unique_products >= 100:
-        score += 3.0
-    elif signals.unique_products >= 50:
         score += 2.0
+    elif signals.unique_products >= 50:
+        score += 1.5
     elif signals.unique_products >= 20:
-        score += 1.0
+        score += 0.75
 
     if signals.has_remote_admin_tool:
-        score += 2.0
+        score += 1.5
     if signals.has_server_stack:
-        score += 2.0
+        score += 1.5
 
-    return min(5.0, score)
+    return min(4.0, score)
+
+
+def outlier_component(asset: dict) -> float:
+    # runZero outlier_score is 0-5; 4/5 should noticeably raise risk.
+    outlier = as_int(asset.get("outlier_score")) or 0
+    if outlier >= 5:
+        return 6.0
+    if outlier == 4:
+        return 4.0
+    return 0.0
+
+
+@dataclass
+class EDRSignals:
+    expected: bool = False
+    present: bool = False
+    vendor: str = ""
+
+
+def edr_score(asset: dict, signals: EDRSignals, dataset_enabled: bool) -> float:
+    if not dataset_enabled or not signals.expected or signals.present:
+        return 0.0
+
+    asset_type = str(asset.get("type") or "").lower()
+    os_blob = " ".join(str(asset.get(k) or "") for k in ("os", "os_product")).lower()
+    if "server" in asset_type or "server" in os_blob:
+        return 5.0
+    return 3.0
 
 
 @dataclass
 class AssetFlags:
     external_confirmed: bool = False
     external_potential: bool = False
-    has_nuclei_real: bool = False
+    has_nuclei_real: bool = False  # true only for high/critical nuclei findings
     has_default_creds: bool = False
 
 
-def total_multiplier(asset: dict, flags: AssetFlags) -> float:
+def total_multiplier(asset: dict, flags: AssetFlags, bridge: BridgeSignals) -> float:
     m = 1.0
     if flags.external_confirmed:
-        m *= 1.20
+        m *= 1.22
     elif flags.external_potential:
         m *= 1.10
+    else:
+        m *= 0.95
 
     if flags.has_nuclei_real:
-        m *= 1.35
+        m *= 1.22
     if flags.has_default_creds:
-        m *= 1.70
+        m *= 1.45
 
     if (flags.external_confirmed or flags.external_potential) and (flags.has_nuclei_real or flags.has_default_creds):
-        m *= 1.15
+        m *= 1.08
+
+    # Bridge/lateral pressure:
+    # 1) Multihome is a standalone risk increaser.
+    # 2) Lateral protocols are a standalone risk increaser.
+    # 3) Additional combo boost when both are present.
+    if bridge.multihome:
+        m *= 1.05
+    elif bridge.partial_multihome:
+        m *= 1.03
+
+    if bridge.lateral_protocol_count >= 3:
+        m *= 1.08
+    elif bridge.lateral_protocol_count >= 1:
+        m *= 1.04
+
+    if (bridge.multihome or bridge.partial_multihome) and bridge.lateral_protocol_count > 0:
+        if bridge.multihome:
+            m *= 1.05
+        else:
+            m *= 1.03
+
+    outlier = as_int(asset.get("outlier_score")) or 0
+    if outlier >= 5:
+        m *= 1.10
+    elif outlier == 4:
+        m *= 1.05
 
     m *= production_multiplier(asset)
 
     crit_rank = as_int(asset.get("criticality_rank")) or 0
     if crit_rank >= 4:
-        m *= 1.25
-    elif crit_rank == 3:
         m *= 1.15
-    elif crit_rank == 2:
+    elif crit_rank == 3:
         m *= 1.08
+    elif crit_rank == 2:
+        m *= 1.04
 
     if asset.get("eol_os"):
-        m *= 1.25
+        m *= 1.15
 
     if asset.get("alive") is False:
-        m *= 0.85
+        m *= 0.90
 
-    return min(2.75, m)
+    return min(2.25, m)
 
 
 def compute_score(
     asset: dict,
     flags: AssetFlags,
+    bridge: BridgeSignals,
     top3_evr: List[float],
     soft: SoftwareSignals,
     vstats: VulnStats,
+    edr: EDRSignals,
+    edr_dataset_enabled: bool,
 ) -> Tuple[int, str, dict]:
     exp = exposure_score(asset, flags)
     vul = vuln_score_from_top3(top3_evr, vstats)
     imp = impact_score(asset)
-    piv = pivot_score(asset)
+    piv = pivot_score(asset, bridge)
     sw = software_score(soft)
+    edr_component = edr_score(asset, edr, edr_dataset_enabled)
+    outlier = outlier_component(asset)
 
-    base = min(100.0, exp + vul + imp + piv + sw)
-    mult = total_multiplier(asset, flags)
+    base = min(100.0, exp + vul + imp + piv + sw + edr_component + outlier)
+    mult = total_multiplier(asset, flags, bridge)
 
     raw = base * mult
-    final = min(100.0, squash_to_100(raw))
+    final_pre_cap = min(100.0, squash_to_100(raw))
+    reach_cap = score_cap_from_exposure(flags)
+    cap_applied = final_pre_cap > float(reach_cap)
+    final = min(final_pre_cap, float(reach_cap))
 
     # Optional stability: round to nearest 5.
-    score_int = round_to_5(final)
+    score_int = quantize_score(final)
     score_int = max(0, min(100, score_int))
 
     band = risk_band(score_int)
@@ -733,14 +1000,27 @@ def compute_score(
         "impact": round(imp, 2),
         "pivot": round(piv, 2),
         "software": round(sw, 2),
+        "edr": round(edr_component, 2),
+        "outlier": round(outlier, 2),
         "base": round(base, 2),
         "mult": round(mult, 3),
         "raw": round(raw, 2),
         "final": round(final, 2),
+        "final_pre_cap": round(final_pre_cap, 2),
+        "reachability_cap": reach_cap,
+        "reachability_cap_applied": cap_applied,
         "external_confirmed": flags.external_confirmed,
         "external_potential": flags.external_potential,
         "nuclei_real": flags.has_nuclei_real,
         "default_creds": flags.has_default_creds,
+        "bridge_multihome": bridge.multihome,
+        "bridge_partial_multihome": bridge.partial_multihome,
+        "bridge_lateral_protocol_count": bridge.lateral_protocol_count,
+        "edr_expected": edr.expected,
+        "edr_present": edr.present,
+        "edr_dataset_enabled": edr_dataset_enabled,
+        "edr_vendor": edr.vendor,
+        "outlier_score": as_int(asset.get("outlier_score")) or 0,
         "software_unique_products": soft.unique_products,
         "software_remote_admin": soft.has_remote_admin_tool,
         "software_server_stack": soft.has_server_stack,
@@ -750,6 +1030,7 @@ def compute_score(
         "vuln_exploitable_count": vstats.exploitable_count,
         "vuln_default_creds_count": vstats.default_creds_count,
         "vuln_nuclei_count": vstats.nuclei_count,
+        "vuln_nuclei_elevated_count": vstats.nuclei_elevated_count,
         "top3_evr": [round(x, 3) for x in top3_evr[:3]],
     }
 
@@ -778,9 +1059,31 @@ def build_rationale(asset: dict, flags: AssetFlags, explain: dict) -> str:
     if flags.has_default_creds:
         reasons.append("Default credentials finding detected")
     if flags.has_nuclei_real:
-        reasons.append("Nuclei-validated vulnerability evidence")
+        reasons.append("High/critical nuclei-validated vulnerability evidence")
+    lateral_count = explain.get("bridge_lateral_protocol_count", 0) or 0
+    if explain.get("bridge_multihome") and lateral_count > 0:
+        reasons.append("Multihomed asset with lateral movement protocol exposure")
+    elif explain.get("bridge_multihome"):
+        reasons.append("Multihomed asset detected across multiple subnets")
+    elif explain.get("bridge_partial_multihome"):
+        reasons.append("Partial multihome evidence from extra addresses")
+
+    if lateral_count > 0 and not explain.get("bridge_multihome"):
+        reasons.append(f"Lateral movement protocols detected ({int(lateral_count)})")
     if explain.get("software_server_stack"):
         reasons.append("Server stack software detected")
+    if (
+        explain.get("edr_dataset_enabled")
+        and explain.get("edr_expected")
+        and not explain.get("edr_present")
+    ):
+        reasons.append("Expected endpoint with no detected Defender/CrowdStrike/SentinelOne telemetry")
+    if (explain.get("outlier_score", 0) or 0) >= 5:
+        reasons.append("Outlier score is 5 (strong anomaly signal)")
+    elif (explain.get("outlier_score", 0) or 0) == 4:
+        reasons.append("Outlier score is 4 (elevated anomaly signal)")
+    if explain.get("reachability_cap_applied"):
+        reasons.append(f"Score capped at {explain.get('reachability_cap')} due external reachability limits")
     if asset.get("eol_os"):
         reasons.append("End-of-life OS signal")
 
@@ -985,6 +1288,32 @@ def main() -> int:
         vuln_best: Dict[str, Dict[str, dict]] = {aid: {} for aid in assets.keys()}
         sw_products: Dict[str, set[str]] = {aid: set() for aid in assets.keys()}
         sw_signals: Dict[str, SoftwareSignals] = {aid: SoftwareSignals() for aid in assets.keys()}
+        bridge_signals: Dict[str, BridgeSignals] = {aid: BridgeSignals() for aid in assets.keys()}
+        edr_signals: Dict[str, EDRSignals] = {aid: EDRSignals() for aid in assets.keys()}
+
+        # Prime external + bridge + EDR signals from asset-side metadata/findings.
+        for aid, a in assets.items():
+            f = flags[aid]
+            b = bridge_signals[aid]
+            e = edr_signals[aid]
+
+            asset_probe = {
+                "findings": a.get("findings"),
+                "attributes": a.get("attributes"),
+                "comments": a.get("comments"),
+            }
+            if object_contains_pattern(asset_probe, HAS_PUBLIC_RE):
+                f.external_confirmed = True
+            if not f.external_confirmed and object_contains_pattern(asset_probe, FINDING_EXTERNAL_RE):
+                f.external_potential = True
+            if object_contains_pattern(asset_probe, MULTIHOME_QUERY_RE):
+                b.multihome = True
+
+            e.expected = edr_expected(a)
+            edr_from_asset = detect_edr_vendor(asset_probe)
+            if edr_from_asset:
+                e.present = True
+                e.vendor = merge_pipe_values(e.vendor, edr_from_asset)
 
         # 2) Stream software rows and compute software-derived signals
         count_software = 0
@@ -1004,6 +1333,17 @@ def main() -> int:
                 sw_signals[aid].has_remote_admin_tool = True
             if text and SERVER_STACK_SOFTWARE_RE.search(text):
                 sw_signals[aid].has_server_stack = True
+
+            edr_from_software = detect_edr_vendor(
+                {
+                    "software_product": product,
+                    "software_vendor": vendor,
+                    "software_attributes": s.get("software_attributes"),
+                }
+            )
+            if edr_from_software:
+                edr_signals[aid].present = True
+                edr_signals[aid].vendor = merge_pipe_values(edr_signals[aid].vendor, edr_from_software)
 
         for aid in assets.keys():
             sw_signals[aid].unique_products = len(sw_products[aid])
@@ -1025,6 +1365,28 @@ def main() -> int:
 
             cat = (v.get("vulnerability_category") or "").strip().lower()
             name = v.get("vulnerability_name") or ""
+            desc = v.get("vulnerability_description") or ""
+            attrs = v.get("vulnerability_attributes") or {}
+
+            vuln_probe = {
+                "name": name,
+                "description": desc,
+                "category": cat,
+                "findings": v.get("findings"),
+                "attributes": attrs,
+            }
+
+            if object_contains_pattern(vuln_probe, HAS_PUBLIC_RE):
+                f.external_confirmed = True
+            if not f.external_confirmed and object_contains_pattern(vuln_probe, FINDING_EXTERNAL_RE):
+                f.external_potential = True
+            if object_contains_pattern(vuln_probe, MULTIHOME_QUERY_RE):
+                bridge_signals[aid].multihome = True
+
+            edr_from_vuln = detect_edr_vendor(vuln_probe)
+            if edr_from_vuln:
+                edr_signals[aid].present = True
+                edr_signals[aid].vendor = merge_pipe_values(edr_signals[aid].vendor, edr_from_vuln)
 
             # Internet Exposure (authoritative)
             if cat == "internet exposure":
@@ -1039,10 +1401,10 @@ def main() -> int:
                 f.has_default_creds = True
 
             has_real_nuclei = is_real_nuclei(v)
-            if has_real_nuclei:
+            has_elevated_nuclei = is_elevated_nuclei(v)
+            if has_elevated_nuclei:
                 f.has_nuclei_real = True
 
-            attrs = v.get("vulnerability_attributes") or {}
             if attrs.get("vscan.type") == "vuln" and PANEL_DETECT_RE.search(name):
                 continue
 
@@ -1067,24 +1429,37 @@ def main() -> int:
                     "exploitable": is_exploitable,
                     "default_creds": has_default_creds,
                     "nuclei": has_real_nuclei,
+                    "nuclei_elevated": has_elevated_nuclei,
                 }
 
         print(f"Vuln rows processed (matched to assets): {count_vulns}")
 
-        # 4) If no Internet Exposure finding, infer potential external from any public IP observed.
+        # 4) Finalize exposure (public IP + query/finding hints) and bridge inference.
         for aid, a in assets.items():
             f = flags[aid]
-            if f.external_confirmed or f.external_potential:
-                continue
-            ip_candidates = []
+            b = bridge_signals[aid]
+            ip_candidates: List[str] = []
             if isinstance(a.get("addresses"), list):
                 ip_candidates.extend(a.get("addresses") or [])
             if isinstance(a.get("addresses_extra"), list):
                 ip_candidates.extend(a.get("addresses_extra") or [])
+
+            has_public_ip = False
             for ip in ip_candidates:
                 if isinstance(ip, str) and is_public_ip(ip):
-                    f.external_potential = True
+                    has_public_ip = True
                     break
+            if has_public_ip:
+                f.external_confirmed = True
+
+            derived_bridge = derive_bridge_signals(a, multihome_query_hit=b.multihome)
+            bridge_signals[aid] = derived_bridge
+
+        edr_expected_total = sum(1 for s in edr_signals.values() if s.expected)
+        edr_present_total = sum(1 for s in edr_signals.values() if s.expected and s.present)
+        edr_dataset_enabled = edr_present_total > 0 if edr_expected_total > 0 else False
+        if edr_expected_total > 0 and not edr_dataset_enabled:
+            print("EDR risk disabled: no Defender/CrowdStrike/SentinelOne telemetry detected for expected endpoint assets.")
 
         # finalize top3 + stats using final reachability state
         for aid in assets.keys():
@@ -1110,6 +1485,8 @@ def main() -> int:
                     stats.default_creds_count += 1
                 if e.get("nuclei"):
                     stats.nuclei_count += 1
+                if e.get("nuclei_elevated"):
+                    stats.nuclei_elevated_count += 1
             vuln_stats[aid] = stats
 
         # 5) Score + update tags
@@ -1118,7 +1495,16 @@ def main() -> int:
         failed = 0
 
         for aid, a in assets.items():
-            score, band, explain = compute_score(a, flags[aid], top3[aid], sw_signals[aid], vuln_stats[aid])
+            score, band, explain = compute_score(
+                a,
+                flags[aid],
+                bridge_signals[aid],
+                top3[aid],
+                sw_signals[aid],
+                vuln_stats[aid],
+                edr_signals[aid],
+                edr_dataset_enabled,
+            )
             rationale = build_rationale(a, flags[aid], explain)
 
             existing_tags_dict = normalize_tags(a.get("tags"))
@@ -1181,6 +1567,7 @@ def main() -> int:
                     "alive": bool(a.get("alive")),
                     "criticality_rank": as_int(a.get("criticality_rank")) or 0,
                     "eol_os": bool(a.get("eol_os")),
+                    "outlier_score": explain.get("outlier_score", as_int(a.get("outlier_score")) or 0),
                     "addresses": pipe_join(a.get("addresses")),
                     "service_protocols": pipe_join(a.get("service_protocols")),
                     "service_count": as_int(a.get("service_count")) or 0,
@@ -1192,6 +1579,8 @@ def main() -> int:
                     "vuln_exploitable_count": explain.get("vuln_exploitable_count", 0),
                     "external_confirmed": explain.get("external_confirmed", False),
                     "external_potential": explain.get("external_potential", False),
+                    "reachability_cap": explain.get("reachability_cap", 100),
+                    "reachability_cap_applied": explain.get("reachability_cap_applied", False),
                     "default_creds": explain.get("default_creds", False),
                     "nuclei_real": explain.get("nuclei_real", False),
                     "top3_evr": pipe_join(explain.get("top3_evr", [])),
@@ -1200,12 +1589,21 @@ def main() -> int:
                     "component_impact": explain.get("impact", 0.0),
                     "component_pivot": explain.get("pivot", 0.0),
                     "component_software": explain.get("software", 0.0),
+                    "component_edr": explain.get("edr", 0.0),
+                    "component_outlier": explain.get("outlier", 0.0),
                     "base_score": explain.get("base", 0.0),
                     "total_multiplier": explain.get("mult", 1.0),
                     "raw_score": explain.get("raw", 0.0),
                     "final_score": explain.get("final", 0.0),
                     "risk_score": score,
                     "risk_band": band,
+                    "bridge_multihome": explain.get("bridge_multihome", False),
+                    "bridge_partial_multihome": explain.get("bridge_partial_multihome", False),
+                    "bridge_lateral_protocol_count": explain.get("bridge_lateral_protocol_count", 0),
+                    "edr_expected": explain.get("edr_expected", False),
+                    "edr_present": explain.get("edr_present", False),
+                    "edr_dataset_enabled": explain.get("edr_dataset_enabled", False),
+                    "edr_vendor": explain.get("edr_vendor", ""),
                     "tag_update_status": update_status,
                     "rationale": rationale,
                 }
